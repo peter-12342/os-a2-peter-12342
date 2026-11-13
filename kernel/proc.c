@@ -5,6 +5,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "pinfo.h"
 
 struct cpu cpus[NCPU];
 
@@ -125,6 +126,12 @@ found:
   p->pid = allocpid();
   p->state = USED;
 
+//initialize scheduling statistics
+  p->runticks = 0;
+  p->nsched = 0;
+  p->ctime = ticks;
+  p->level = 0;
+
   // Allocate a trapframe page.
   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
     freeproc(p);
@@ -162,13 +169,18 @@ freeproc(struct proc *p)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
   p->sz = 0;
-  p->pid = 0;
-  p->name[0] = 0;
   p->chan = 0;
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  p->pid = 0;
+  p->runticks = 0;
+  p->nsched = 0;
+  p->ctime = 0;
+  p->name[0] = 0;
+  p->level = 0;
 }
+
 
 // Create a user page table for a given process, with no user memory,
 // but with trampoline and trapframe pages.
@@ -450,6 +462,9 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+
+	p->nsched++;
+
         swtch(&c->context, &p->context);
 
         // Don't re-enable interrupts on release.
@@ -686,6 +701,7 @@ procdump(void)
     [ZOMBIE]    = "zombie"
     // clang-format on
   };
+
   struct proc *p;
   char *state;
 
@@ -701,3 +717,51 @@ procdump(void)
     printk("\n");
   }
 }
+
+
+
+int
+getpinfo(uint64 buf, int max)
+{
+  struct proc *p;
+  struct proc *caller = myproc();
+  struct pinfo info;
+  int count = 0;
+
+  if(max < 0)
+    return -1;
+
+  for(p = proc; p < &proc[NPROC]; p++){
+    if(count >= max)
+      break;
+
+    acquire(&p->lock);
+
+    if(p->state == UNUSED){
+      release(&p->lock);
+      continue;
+    }
+
+    // Copy process data into a local snapshot.
+    info.pid = p->pid;
+    info.state = p->state;
+    info.level = p->level;
+    info.runticks = p->runticks;
+    info.nsched = p->nsched;
+    info.ctime = p->ctime;
+    memmove(info.name, p->name, sizeof(info.name));
+
+    release(&p->lock);
+
+    // Copy the snapshot into user memory.
+    if(copyout(caller->pagetable, caller->sz,
+               buf + count * sizeof(info),
+               (char *)&info, sizeof(info)) < 0)
+      return -1;
+
+    count++;
+  }
+
+  return count;
+}
+
