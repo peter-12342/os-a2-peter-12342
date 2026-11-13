@@ -93,7 +93,7 @@ struct proc {
   int nsched;      // Number of times scheduled
   int ctime;       // Creation time in ticks
   int level;
-
+  int used_time;   // Ticks used at current MLFQ level
 
 
 

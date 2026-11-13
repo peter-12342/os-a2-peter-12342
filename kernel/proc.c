@@ -11,6 +11,12 @@ struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
 
+// MLFQ round-robin state.
+static struct spinlock mlfq_lock;
+static int rr_cursor[4];
+
+
+
 struct proc *initproc;
 
 int nextpid = 1;
@@ -49,6 +55,12 @@ void
 procinit(void)
 {
   struct proc *p;
+
+  initlock(&mlfq_lock, "mlfq");
+
+for(int i = 0; i < 4; i++){
+  rr_cursor[i] = -1;
+}
 
   initlock(&pid_lock, "nextpid");
   initlock(&wait_lock, "wait_lock");
@@ -131,6 +143,7 @@ found:
   p->nsched = 0;
   p->ctime = ticks;
   p->level = 0;
+  p->used_time = 0;
 
   // Allocate a trapframe page.
   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
@@ -179,6 +192,7 @@ freeproc(struct proc *p)
   p->ctime = 0;
   p->name[0] = 0;
   p->level = 0;
+  p->used_time = 0;
 }
 
 
@@ -437,52 +451,140 @@ kwait(uint64 addr)
 //  - swtch to start running that process.
 //  - eventually that process transfers control
 //    via swtch back to the scheduler.
+
+
 void
 scheduler(void)
 {
-  struct proc *p;
   struct cpu *c = mycpu();
+  struct proc *p;
+  struct proc *chosen;
 
   c->proc = 0;
-  for (;;) {
-    // The most recent process to run may have had interrupts
-    // turned off; enable them to avoid a deadlock if all
-    // processes are waiting. Then turn them back off
-    // to avoid a possible race between an interrupt
-    // and wfi.
+
+  for(;;){
     intr_on();
     intr_off();
 
-    int found = 0;
-    for (p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if (p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
+    chosen = 0;
 
-	p->nsched++;
+    // Serialize selection and round-robin cursor updates.
+    acquire(&mlfq_lock);
 
-        swtch(&c->context, &p->context);
+    // Search priority levels from highest to lowest.
+    for(int level = 0; level < 4 && chosen == 0; level++){
 
-        // Don't re-enable interrupts on release.
-        mycpu()->intena = 0;
+      // Start just after this level's last selected slot.
+      for(int step = 1; step <= NPROC; step++){
+        int index = (rr_cursor[level] + step) % NPROC;
+        p = &proc[index];
 
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
+        acquire(&p->lock);
+
+        if(p->state == RUNNABLE && p->level == level){
+          chosen = p;
+          rr_cursor[level] = index;
+          break;  // Keep chosen process locked.
+        }
+
+        release(&p->lock);
       }
-      release(&p->lock);
     }
-    if (found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
+
+    release(&mlfq_lock);
+
+    if(chosen != 0){
+      // chosen->lock is still held.
+      chosen->state = RUNNING;
+      c->proc = chosen;
+      chosen->nsched++;
+
+      swtch(&c->context, &chosen->context);
+
+      // The process has returned to the scheduler.
+      mycpu()->intena = 0;
+      c->proc = 0;
+      release(&chosen->lock);
+    } else {
+      // No runnable process was found.
       asm volatile("wfi");
     }
   }
 }
+
+
+
+int
+mlfq_tick(struct proc *p)
+{
+  static const int slices[4] = {1, 2, 4, 8};
+  int level;
+  int should_yield = 0;
+
+  // Charge the timer tick and update MLFQ usage.
+  acquire(&p->lock);
+
+  p->runticks++;
+  p->used_time++;
+
+  level = p->level;
+
+  // Demote after using a complete time slice.
+  if(p->used_time >= slices[level]){
+    if(p->level < 3)
+      p->level++;
+
+    p->used_time = 0;
+    should_yield = 1;
+  }
+
+  release(&p->lock);
+
+  // A completed slice always causes a yield.
+  if(should_yield)
+    return 1;
+
+  // Otherwise, check for higher-priority runnable work.
+  for(struct proc *other = proc; other < &proc[NPROC]; other++){
+    if(other == p)
+      continue;
+
+    acquire(&other->lock);
+
+    if(other->state == RUNNABLE && other->level < level)
+      should_yield = 1;
+
+    release(&other->lock);
+
+    if(should_yield)
+      break;
+  }
+
+  return should_yield;
+}
+
+void
+mlfq_boost(void)
+{
+  struct proc *p;
+
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+
+    if(p->state != UNUSED){
+      p->level = 0;
+      p->used_time = 0;
+    }
+
+    release(&p->lock);
+  }
+}
+
+
+
+
+
+
 
 // Switch to scheduler.  Must hold only p->lock
 // and have changed proc->state. Saves and restores
