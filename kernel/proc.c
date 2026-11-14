@@ -502,7 +502,6 @@ scheduler(void)
       swtch(&c->context, &chosen->context);
 
       // The process has returned to the scheduler.
-      mycpu()->intena = 0;
       c->proc = 0;
       release(&chosen->lock);
     } else {
